@@ -1,11 +1,15 @@
 package handlers
 
 import (
+	"fmt"
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/woonmapao/commerce-orchestrator-go/models"
 	"github.com/woonmapao/commerce-orchestrator-go/responses"
+	"github.com/woonmapao/commerce-orchestrator-go/services"
+	"github.com/woonmapao/commerce-orchestrator-go/validation"
 )
 
 func PurchaseOrder(c *gin.Context) {
@@ -16,11 +20,12 @@ func PurchaseOrder(c *gin.Context) {
 		c.JSON(http.StatusBadRequest,
 			responses.PurchaseErrorResponse([]string{
 				"Invalid purchase format",
+				err.Error(),
 			}))
 	}
 
 	// validate input data
-	err = ValidatePurchaseOrderData(&purchaseOrder)
+	err = validation.ValidatePurchaseOrderData(&purchaseOrder)
 	if err != nil {
 		c.JSON(http.StatusBadRequest,
 			responses.PurchaseErrorResponse([]string{
@@ -29,7 +34,7 @@ func PurchaseOrder(c *gin.Context) {
 	}
 
 	// check user existence
-	user, err := GetUserByID(purchaseOrder.UserID)
+	user, err := services.GetUserByID(purchaseOrder.UserID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest,
 			responses.PurchaseErrorResponse([]string{
@@ -40,10 +45,10 @@ func PurchaseOrder(c *gin.Context) {
 
 	// check product existence and available stock + calculate subtotal
 	var subtotal float64
-	for _, product := range purchaseOrder.ProductsID {
+	for _, product := range purchaseOrder.Products {
 
 		// find if product exist
-		p, err := GetProductByID(product.ProductID)
+		p, err := services.GetProductByID(product.ProductID)
 		if err != nil {
 			c.JSON(http.StatusBadRequest,
 				responses.PurchaseErrorResponse([]string{
@@ -53,48 +58,62 @@ func PurchaseOrder(c *gin.Context) {
 		}
 
 		// compare purchase quantity and available stock
-		if product.quantity > p.Stock {
+		if product.Quantity > p.StockQuantity {
 			c.JSON(http.StatusBadRequest,
 				responses.PurchaseErrorResponse([]string{
-					"Insufficient stock for ProductID: " + string(product.ProductID),
+					"Insufficient stock for ProductID: " + fmt.Sprint(product.ProductID),
 					err.Error(),
 				}))
 			return
 		}
 
-		subtotal += float64(product.quantity) * p.Price
+		_, err = services.UpdateStock(product.ProductID, product.Quantity)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError,
+				responses.PurchaseErrorResponse([]string{
+					"Failed to update stock",
+					err.Error(),
+				}))
+		}
 
-		UpdateStock(product.ProductID, product.Quantity)
+		subtotal += float64(product.Quantity) * p.Price
+		log.Printf("Calculating subtotal: %v + %s:%v", subtotal, p.Name, p.Price)
 	}
 	totalAmount := subtotal
+	log.Printf("Total amount : %v", totalAmount)
 
 	// create order
-	orderID, err := CreateOrder(purchaseOrder.UserID, totalAmount)
+	orderID, err := services.CreateOrder(purchaseOrder.UserID, totalAmount)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError,
 			responses.PurchaseErrorResponse([]string{
 				"Failed to create order",
 				err.Error(),
 			}))
+		log.Printf("Failed to create order. Error: %s", err.Error())
 		return
 	}
+	log.Printf("Order created successfully, OrderID: %d", orderID)
 
 	// create order detail
+	productList := make([]string, len(purchaseOrder.Products))
 	for _, product := range purchaseOrder.Products {
-		productInfo, _ := getProductByID(product.ProductID)
+		productInfo, _ := services.GetProductByID(product.ProductID)
 		subtotal := float64(product.Quantity) * productInfo.Price
-		CreateOrderDetail(orderID.gorm.Model.ID, product.ProductID, product.Quantity, subtotal)
+		services.CreateOrderDetail(int(orderID), product.ProductID, product.Quantity, subtotal)
+		productList = append(productList, productInfo.Name)
 	}
 
-	// * dont for get to do transaction
-	// validate input data
-	// check user, product exist
-	// get product price, stock
-	// compare purchase quantity and available stock
-	// calculate subtotal
-	// update stock + create multiple order details
-	// calculate TotalAmount + create an Order
-	// link order details to that Order
-	// return response
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "success",
+		"message": "Purchase order successful",
+		"data": gin.H{
+			"userID":            user.ID,
+			"username":          user.Username,
+			"orderID":           orderID,
+			"totalAmount":       totalAmount,
+			"product_purchased": productList,
+		},
+	})
 
 }
